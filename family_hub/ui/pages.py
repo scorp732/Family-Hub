@@ -170,7 +170,52 @@ def render_dashboard(user_data: Dict[str, Any]):
     
     with col2:
         # Tasks card
-        tasks_content = "<p>Your tasks will appear here.</p>"
+        from family_hub.tasks.service import get_task_summary
+        
+        # Get user's tasks
+        user_tasks = get_task_summary(user_data.get("family_id"), user_data.get("id"))
+        
+        if user_tasks:
+            # Display up to 3 tasks
+            display_tasks = user_tasks[:3]
+            
+            tasks_content = ""
+            for task in display_tasks:
+                # Format due date if exists
+                due_date_display = ""
+                if task.get("due_date"):
+                    due_date = datetime.fromisoformat(task["due_date"].replace('Z', '+00:00')) if isinstance(task["due_date"], str) else task["due_date"]
+                    due_date_display = f"<span style='color: {COLOR_PALETTE['accent3']}; font-size: 0.8em;'> • Due: {due_date.strftime('%b %d')}</span>"
+                
+                # Get priority color
+                priority = task.get("priority", 1)
+                priority_colors = {
+                    0: COLOR_PALETTE["info"],         # Low priority
+                    1: COLOR_PALETTE["accent4"],      # Medium priority
+                    2: COLOR_PALETTE["warning"],      # High priority
+                    3: COLOR_PALETTE["error"]         # Urgent priority
+                }
+                priority_color = priority_colors.get(priority, COLOR_PALETTE["accent4"])
+                
+                # Add task to content
+                tasks_content += f"""
+                <div style='margin-bottom: 10px; padding: 8px; border-left: 3px solid {priority_color}; background: linear-gradient(to right, {COLOR_PALETTE["bg_light"]}40, transparent);'>
+                    <div style='font-weight: bold;'>{task.get("title")}</div>
+                    <div style='font-size: 0.8em; color: {COLOR_PALETTE["text"]};'>
+                        {task.get("status", "todo").replace("_", " ").title()}{due_date_display}
+                    </div>
+                </div>
+                """
+            
+            # Add "View all" link
+            tasks_content += f"""
+            <div style='text-align: center; margin-top: 10px;'>
+                <a href='#' onclick='none' style='color: {COLOR_PALETTE["primary"]}; text-decoration: none;'>View all tasks →</a>
+            </div>
+            """
+        else:
+            tasks_content = "<p>You don't have any tasks yet. Click to create one!</p>"
+        
         render_card(
             title="My Tasks",
             content=tasks_content,
@@ -231,11 +276,229 @@ def render_calendar_page(user_data: Dict[str, Any]):
 def render_tasks_page(user_data: Dict[str, Any]):
     """Render the tasks page"""
     st.markdown("# Tasks")
-    st.markdown("Your family tasks will be displayed here.")
     
-    # Add task button
-    if st.button("➕ Add Task"):
-        st.info("Task creation functionality will be implemented here.")
+    # Get family ID
+    family_id = user_data.get("family_id")
+    user_id = user_data.get("id")
+    
+    # Create tabs for different task views
+    tabs = ["My Tasks", "Family Tasks", "Create Task"]
+    selected_tab = render_tabs(tabs)
+    
+    if selected_tab == "Create Task":
+        render_create_task_form(user_data)
+    else:
+        # Determine which tasks to show
+        if selected_tab == "My Tasks":
+            show_user_tasks = True
+        else:  # Family Tasks
+            show_user_tasks = False
+        
+        # Render task list with filters
+        render_task_list(family_id, user_id, show_user_tasks)
+
+
+def render_create_task_form(user_data: Dict[str, Any]):
+    """Render form for creating a new task"""
+    from family_hub.tasks.service import create_task
+    from family_hub.data.models import TaskPriority
+    from family_hub.data.storage import DataManager
+    
+    st.markdown("### Create New Task")
+    
+    with st.form("create_task_form"):
+        # Basic task info
+        title = st.text_input("Title", placeholder="Enter task title")
+        description = st.text_area("Description", placeholder="Enter task description (optional)")
+        
+        # Due date
+        due_date = st.date_input("Due Date", value=None)
+        
+        # Priority selection
+        priority_options = {
+            "Low": 0,
+            "Medium": 1,
+            "High": 2,
+            "Urgent": 3
+        }
+        priority_str = st.select_slider(
+            "Priority",
+            options=list(priority_options.keys()),
+            value="Medium"
+        )
+        priority = priority_options[priority_str]
+        
+        # Assignees
+        family_id = user_data.get("family_id")
+        family_members = DataManager.get_users_by_family(family_id)
+        
+        # Create options for multiselect
+        member_options = {f"{member.get('display_name')} ({member.get('username')})": member.get('id')
+                          for member in family_members}
+        
+        selected_members = st.multiselect(
+            "Assign To",
+            options=list(member_options.keys()),
+            default=[f"{user_data.get('display_name')} ({user_data.get('username')})"]
+        )
+        
+        # Convert selected members to user IDs
+        assigned_to = [member_options[member] for member in selected_members]
+        
+        # Submit button
+        submitted = st.form_submit_button("Create Task")
+        
+        if submitted:
+            if not title:
+                st.error("Title is required")
+            else:
+                # Convert date to datetime if provided
+                due_datetime = None
+                if due_date:
+                    due_datetime = datetime.combine(due_date, datetime.min.time())
+                
+                # Create the task
+                try:
+                    task = create_task(
+                        title=title,
+                        family_id=family_id,
+                        created_by=user_data.get("id"),
+                        description=description,
+                        priority=TaskPriority(priority),
+                        due_date=due_datetime,
+                        assigned_to=assigned_to
+                    )
+                    
+                    st.success("Task created successfully!")
+                    
+                    # Clear form by rerunning
+                    time.sleep(1)
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"Error creating task: {str(e)}")
+
+
+def render_task_list(family_id: str, user_id: str, show_user_tasks: bool = True):
+    """Render a list of tasks with filters and actions"""
+    from family_hub.tasks.service import get_task_summary, update_task_status, delete_task
+    from family_hub.data.models import TaskStatus
+    
+    # Add filters in an expander
+    with st.expander("Filters", expanded=False):
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            # Status filter
+            status_options = ["All", "To Do", "In Progress", "Done", "Cancelled"]
+            selected_status = st.selectbox("Status", options=status_options, index=0)
+            
+            # Convert UI status to model status
+            status_map = {
+                "To Do": TaskStatus.TODO,
+                "In Progress": TaskStatus.IN_PROGRESS,
+                "Done": TaskStatus.DONE,
+                "Cancelled": TaskStatus.CANCELLED
+            }
+            filter_status = status_map.get(selected_status) if selected_status != "All" else None
+        
+        with col2:
+            # Priority filter
+            priority_options = ["All", "Low", "Medium", "High", "Urgent"]
+            selected_priority = st.selectbox("Priority", options=priority_options, index=0)
+            
+            # Convert UI priority to model priority
+            priority_map = {
+                "Low": 0,
+                "Medium": 1,
+                "High": 2,
+                "Urgent": 3
+            }
+            filter_priority = priority_map.get(selected_priority) if selected_priority != "All" else None
+    
+    # Get tasks based on filters
+    if show_user_tasks:
+        # Get tasks assigned to the user
+        tasks = get_task_summary(family_id, user_id)
+    else:
+        # Get all family tasks
+        tasks = get_task_summary(family_id)
+    
+    # Apply filters
+    if filter_status:
+        tasks = [task for task in tasks if task.get("status") == filter_status.value]
+    
+    if filter_priority is not None:  # Check for None specifically since priority 0 is valid
+        tasks = [task for task in tasks if task.get("priority") == filter_priority]
+    
+    # Display tasks
+    if not tasks:
+        render_empty_state(
+            message="No tasks found matching your filters",
+            icon="📝",
+            action_label="Create Task",
+            on_action=lambda: st.session_state.update(selected_tab="Create Task")
+        )
+    else:
+        # Display each task with actions
+        for task in tasks:
+            with st.container():
+                col1, col2 = st.columns([4, 1])
+                
+                with col1:
+                    # Render task using the component
+                    render_task_item(task)
+                
+                with col2:
+                    # Task actions
+                    task_id = task.get("id")
+                    
+                    # Status update
+                    current_status = TaskStatus(task.get("status", "todo"))
+                    status_options = [s.value for s in TaskStatus]
+                    
+                    # Format status options for display
+                    status_display = {
+                        "todo": "To Do",
+                        "in_progress": "In Progress",
+                        "done": "Done",
+                        "cancelled": "Cancelled"
+                    }
+                    
+                    new_status = st.selectbox(
+                        "Status",
+                        options=status_options,
+                        index=status_options.index(current_status.value),
+                        format_func=lambda x: status_display.get(x, x.replace("_", " ").title()),
+                        key=f"status_{task_id}"
+                    )
+                    
+                    # Update status if changed
+                    if new_status != current_status.value:
+                        try:
+                            update_task_status(task_id, TaskStatus(new_status), user_id)
+                            st.success("Status updated!")
+                            time.sleep(0.5)
+                            st.rerun()
+                        except Exception as e:
+                            st.error(f"Error updating status: {str(e)}")
+                    
+                    # Delete button
+                    if st.button("Delete", key=f"delete_{task_id}"):
+                        # Confirm deletion
+                        if st.session_state.get(f"confirm_delete_{task_id}", False):
+                            try:
+                                delete_task(task_id)
+                                st.success("Task deleted!")
+                                time.sleep(0.5)
+                                st.rerun()
+                            except Exception as e:
+                                st.error(f"Error deleting task: {str(e)}")
+                        else:
+                            st.session_state[f"confirm_delete_{task_id}"] = True
+                            st.warning("Click again to confirm deletion")
+                
+                # Separator
+                st.markdown("<hr style='margin: 10px 0; opacity: 0.3;'/>", unsafe_allow_html=True)
 
 # Budget Page
 def render_budget_page(user_data: Dict[str, Any]):
